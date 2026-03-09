@@ -1,0 +1,451 @@
+---
+title: "**Assignment 6: Ensemble Tree-based Methods**"
+output: html_document
+---
+
+#### **Topic: Predicting 30-Day Hospital Readmission After Myocardial Infarction**
+
+Researchers are interested in predicting 30-day readmission risk among patients hospitalized for acute myocardial infarction (AMI). 
+
+**Goal:** To predict 30-day hospital readmission following AMI using clinical and demographic features, and to conduct a reproducible analysis to build and compare two classification models: an elastic net (penalized logistic regression) and a random forest (ensemble tree-based method).
+
+The dataset consists of an ID variable, 14 features describing clinical tests and comorbidities, and an indicator for whether the individual was readmitted to the hospital within 30 days of discharge. 
+
+**Feature Information:**
+
+* `readmission`:  Readmitted within 30 days (Yes/No) (Outcome) [Categorical]
+* `Age`:          Age at initial MI in years [Continuous]
+* `Sex`:          Reported by patient — 0: Male, 1: Female, 2: Non-binary/Other [Categorical]
+* `sodium`:       Serum sodium (mmol/L) [Continuous]
+* `ALT`:          Liver enzymes (IU/L) [Continuous]
+* `WBC`:          White blood cell count (billions/L) [Continuous]
+* `ESR`:          Erythrocyte sedimentation rate [Continuous]
+* `SBP`:          Systolic blood pressure at intake (mmHg) [Continuous]
+* `DBP`:          Diastolic blood pressure at intake (mmHg) [Continuous]
+* `Pulm.adema`:   Pulmonary edema (1=Yes, 0=No) [Categorical]
+* `FC`:           Functional class of angina pectoris in the last year (0–4) [Categorical]
+* `Arrythmia`:    Presence of arrhythmia (1=Yes, 0=No) [Categorical]
+* `Diab`:         Presence of diabetes (1=Yes, 0=No) [Categorical]
+* `Obesity`:      Presence of obesity (1=Yes, 0=No) [Categorical]
+* `Asthma`:       Presence of asthma (1=Yes, 0=No) [Categorical]
+
+---
+
+#### **0. Data preparation**
+
+**Set up needed libraries**
+
+```{r setup_library, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(glmnet)
+library(pROC)
+
+set.seed(123)
+```
+
+
+**Import dataset**
+```{r import, message=FALSE}
+mi_df = read_csv(file = "./mi.data.csv")
+mi_df = mi_df |> select(-ID)    
+mi_df
+```
+
+**Clean dataset**
+
+```{r clean, message=FALSE}
+miss_count = colSums(is.na(mi_df))
+cat("Missing values per variable:\n")
+print(miss_count)
+
+mi_df = mi_df[complete.cases(mi_df), ]
+cat("\nTotal observations after removing missing:", nrow(mi_df), "\n")
+
+mi_df = mi_df |>
+  mutate(
+    Sex        = as.factor(Sex),
+    Pulm.adema = factor(Pulm.adema, levels = c("0", "1")),
+    FC         = factor(FC,         levels = c("0", "1", "2", "3", "4")),
+    Arr        = factor(Arr,        levels = c("0", "1")),   # original column name
+    Diab       = factor(Diab,       levels = c("0", "1")),
+    Obesity    = factor(Obesity,    levels = c("0", "1")),
+    Asthma     = factor(Asthma,     levels = c("0", "1")),
+    readmission = factor(ifelse(readmission == 1, "Yes", "No"),
+                         levels = c("No", "Yes"))
+  )
+
+mi_df
+```
+
+**Overview of continuous features**
+
+```{r descriptives, message=FALSE}
+mi_df |>
+  summarise(across(where(is.numeric),
+                   list(Mean = ~round(mean(.), 2),
+                        SD   = ~round(sd(.), 2),
+                        Min  = ~round(min(.), 2),
+                        Max  = ~round(max(.), 2)))) |>
+  pivot_longer(everything(),
+               names_to  = c("Variable", "Stat"),
+               names_sep = "_(?=[^_]+$)") |>
+  pivot_wider(names_from  = Stat,
+              values_from = value) |>
+  knitr::kable(caption = "Table 1: Descriptive Statistics of Continuous Features")
+```
+
+**Check outcome balance**
+
+```{r balance, message=FALSE}
+balance_tbl = mi_df |>
+  count(readmission) |>
+  mutate(Percent = round(100 * n / sum(n), 1))
+
+balance_tbl |>
+  knitr::kable(caption = "Table 2: Frequency and Proportion of Readmission Outcome")
+```
+
+**NOTE:** From **Table 2**, we observe an imbalance in the outcome variable, with the
+majority of patients not readmitted within 30 days of discharge. To prevent models from
+being biased toward always predicting the majority class (no readmission), **down-sampling**
+will be applied within each cross-validation fold. This corrects for the imbalance during
+training without leaking information from held-out folds into the resampling process, and
+ensures that sensitivity — the model's ability to correctly identify patients who will truly
+be readmitted — is not sacrificed in favor of inflated overall accuracy.
+
+**Partition the data into training and testing using a 70/30 split**
+
+```{r split, message=FALSE}
+set.seed(123)
+
+train_indices = createDataPartition(y = mi_df$readmission, p = 0.7, list = FALSE)
+train_data    = mi_df[ train_indices, ]
+test_data     = mi_df[-train_indices, ]
+
+split_counts = tibble(
+  Dataset = c("Training data", "Testing data"),
+  N       = c(nrow(train_data), nrow(test_data)),
+  Percent = round(100 * N / nrow(mi_df), 1)
+)
+
+split_counts |>
+  knitr::kable(caption = "Table 3: Number of Observations in Training and Test Sets")
+```
+
+**NOTE:** A stratified 70/30 split using `createDataPartition()` preserves the proportion of readmitted patients in both sets. The test set is set aside completely and will not be examined until final model evaluation in Section 2. All model selection decisions are made
+using cross-validation performance on the training set only.
+
+All 14 features are retained for modeling based on the following reasoning:
+
+* `Age`, `SBP`, `DBP`, `sodium`, and `WBC` are established clinical indicators of acute
+  cardiac condition severity and physiological stress at admission.
+* `ALT` and `ESR` capture liver function and systemic inflammation, both associated with
+  post-AMI recovery trajectory and complication risk.
+* `Pulm.adema`, `FC`, and `Arrythmia` reflect direct cardiac complications at admission
+  that are known predictors of adverse post-discharge outcomes.
+* `Diab`, `Obesity`, and `Asthma` are comorbidities that increase readmission risk by
+  complicating recovery and elevating vulnerability to secondary events.
+* `Sex` is retained to capture potential differences in clinical presentation and outcomes
+  across patient groups.
+
+---
+
+#### **1. The Comparison of Two Models**
+
+Construct **two prediction models** to predict 30-day readmission using all features. Each
+model is optimized via cross-validation on the *training data*, and performance is compared
+before any evaluation on the test set. The two algorithms used are:
+
+* **a) Random Forest** — an ensemble of decision trees built on bootstrapped samples, where
+  each tree uses a random subset of features at each split to reduce correlation between trees.
+* **b) Gradient Boosting Machine (GBM)** — an ensemble that grows trees *sequentially*, where
+  each new tree corrects the errors (pseudo-residuals) of the prior model, learning slowly
+  and deliberately to improve prediction.
+
+First, a shared 10-fold cross-validation control is created for use across both models.
+*Down-sampling* is applied within each fold to correct for class imbalance in the outcome.
+
+```{r control, message=FALSE}
+train_control = trainControl(
+  method          = "cv",
+  number          = 10,
+  sampling        = "down",        # down-sample majority class within each fold
+  classProbs      = TRUE,          # needed to generate predicted probabilities for ROC
+  savePredictions = "final"        # saves fold-level predictions for confusionMatrix()
+)
+```
+
+---
+
+**a) Random Forest**
+
+A random forest model that tunes `mtry` — the number of features eligible for selection
+at each split — via 10-fold cross-validation.
+
+```{r rf, message=FALSE}
+set.seed(123)
+
+p = ncol(train_data) - 1   # total number of predictors (all columns minus outcome)
+
+# Three mtry values tested, following the lecture demo approach:
+#   p       → equivalent to bagging (all features at each split, trees are correlated)
+#   sqrt(p) → standard recommendation for RF classification tasks
+#   0.5*p   → intermediate de-correlation between bagging and full RF
+mtry_vals = c(p, round(sqrt(p)), round(0.5 * p))
+mtry_grid  = expand.grid(.mtry = mtry_vals)
+
+model_rf = train(
+  readmission ~ .,
+  data      = train_data,
+  method    = "rf",
+  metric    = "Accuracy",
+  tuneGrid  = mtry_grid,
+  trControl = train_control,
+  ntree     = 500            # 500 trees — RF does not overfit with more trees
+)
+
+# Best mtry value selected by cross-validation
+model_rf$bestTune
+
+# CV accuracy for each mtry value tested
+model_rf$results
+
+# Variable importance: accuracy-based OOB importance
+# Measures how much prediction accuracy drops when each variable is randomly permuted
+varImp(model_rf)
+
+plot(varImp(model_rf), top = 10,
+     main = "Figure 1: Random Forest — Top 10 Features by Variable Importance")
+
+# Both MeanDecreaseAccuracy and MeanDecreaseGini displayed side by side
+varImpPlot(model_rf$finalModel,
+           main = "Figure 2: Random Forest — Variable Importance (Both Measures)")
+
+# Cross-validated confusion matrix from training folds
+confusionMatrix(model_rf)
+```
+
+**Description:** The optimal `mtry` value selected via cross-validation was [*update after running*],
+yielding a mean CV accuracy of [*X*]% and Kappa of [*X*] after down-sampling. [*Describe
+whether smaller or larger mtry performed better — e.g., "mtry = sqrt(p) outperformed
+mtry = p, suggesting that restricting features at each split effectively de-correlates
+trees and reduces variance compared to bagging."*] As shown in _Figure 1_ and _Figure 2_,
+`Age` and [*X*] ranked as the most important predictors in both importance measures,
+consistent with established clinical risk factors for AMI readmission. The cross-validated
+confusion matrix shows the model correctly identified [*X*]% of true readmission cases
+and [*X*]% of non-readmission cases on average across folds.
+
+---
+
+**b) Gradient Boosting Machine (GBM)**
+
+A GBM model that tunes four hyperparameters via 10-fold cross-validation: `n.trees`
+(number of trees), `shrinkage` (learning rate λ), `interaction.depth` (tree depth d),
+and `n.minobsinnode` (minimum observations per terminal node).
+
+```{r gbm, message=FALSE}
+set.seed(123)
+
+# Hyperparameter tuning grid:
+#   n.trees:           number of sequential boosting iterations
+#   shrinkage:         learning rate — smaller = slower learning, requires more trees
+#                      0.01 and 0.001 are typical starting values from lecture
+#   interaction.depth: d=1 → stumps (additive model, no interactions) — weak learner approach
+#                      d=3 → allows 3-way interactions, more complex
+#   n.minobsinnode:    minimum cases per terminal node, controls tree size
+grid_gbm = expand.grid(
+  n.trees           = c(100, 200, 300, 500),
+  shrinkage         = c(0.01, 0.001),
+  interaction.depth = c(1, 3),
+  n.minobsinnode    = 10
+)
+
+model_gbm = train(
+  readmission ~ .,
+  data         = train_data,
+  method       = "gbm",
+  distribution = "bernoulli",   # bernoulli distribution for binary classification
+  metric       = "Accuracy",
+  tuneGrid     = grid_gbm,
+  trControl    = train_control,
+  verbose      = FALSE          # suppress per-iteration output
+)
+
+# Best hyperparameter combination selected by CV
+model_gbm$bestTune
+
+# Top CV results — look for selected shrinkage and interaction depth
+model_gbm$results |>
+  arrange(desc(Accuracy)) |>
+  select(n.trees, shrinkage, interaction.depth, Accuracy, Kappa) |>
+  head(10)
+
+# Variable importance: relative influence
+# Average improvement in split criterion across all trees where variable is used
+# Variable importance via summary() — works directly with gbm package
+# summary() computes relative influence and plots automatically
+gbm_imp = summary(model_gbm$finalModel,
+                  n.trees = model_gbm$bestTune$n.trees,
+                  plotit  = FALSE)
+
+# Show top 10 by relative influence
+gbm_imp |>
+  slice_max(rel.inf, n = 10) |>
+  ggplot(aes(x = rel.inf, y = reorder(var, rel.inf))) +
+  geom_col(fill = "steelblue") +
+  labs(x     = "Relative Influence",
+       y     = "Feature",
+       title = "Figure 3: GBM — Top 10 Features by Variable Importance") +
+  theme_minimal()
+
+
+# Cross-validated confusion matrix from training folds
+confusionMatrix(model_gbm)
+```
+
+**Description:** The optimal hyperparameters selected via cross-validation were
+`n.trees` = [*update*], `shrinkage` = [*update*], and `interaction.depth` = [*update*],
+yielding a mean CV accuracy of [*X*]% and Kappa of [*X*] after down-sampling.
+[*Describe shrinkage result — e.g., "A shrinkage of 0.01 was selected, indicating a
+faster learning rate with fewer trees was sufficient for this dataset."*]
+[*Describe depth — e.g., "An interaction depth of 1 was selected, consistent with the
+lecture recommendation that weak learners work well in boosting."*] As shown in _Figure 3_,
+`Age` and [*X*] were the most influential predictors by relative influence. The
+cross-validated confusion matrix shows the model correctly identified [*X*]% of true
+readmission cases and [*X*]% of non-readmission cases on average across folds.
+
+---
+
+#### **2. Model Selection**
+
+Select an "optimal" model and calculate final evaluation metrics in the test set.
+**Only one model should be applied to the test set.** What do you conclude about your
+final model's performance?
+
+**Compare Models on Training Performance**
+
+```{r comparison, message=FALSE}
+results = resamples(list(
+  RandomForest = model_rf,
+  GBM          = model_gbm
+))
+
+summary(results)
+
+bwplot(results,
+       main = "Figure 4: 10-Fold CV Performance — Random Forest vs. GBM")
+```
+
+**Description:** As shown in the accuracy and Kappa results above and _Figure 4_,
+[*model name*] achieved the highest mean CV accuracy ([*X*]%, Kappa = [*X*]), compared to
+[*other model*] ([*X*]%, Kappa = [*X*]). **[*selected model*] is selected as the final
+model** because [*fill in after seeing results — example options:*]
+
+* *If GBM wins:* "GBM achieved meaningfully higher CV accuracy and Kappa, indicating
+  superior ability to distinguish readmitted from non-readmitted patients. The boosting
+  approach's sequential correction of residuals may be better suited to this dataset
+  where subtle compounding risk factors drive readmission."
+* *If RF wins:* "Random Forest achieved higher CV accuracy and produced more stable
+  performance across folds as shown by the narrower box in Figure 4. Its parallel
+  ensemble structure is more robust when the signal-to-noise ratio is low, as may be
+  the case in this relatively small clinical dataset."
+
+**Final Model Evaluation (Test Set)**
+
+The final [*selected model*] is applied once to the held-out test set to report
+unbiased evaluation metrics.
+
+```{r evaluation, message=FALSE}
+set.seed(123)
+
+# Update to model_rf if Random Forest was selected in the comparison above
+final_model = model_gbm   # <-- update based on Section 2 results
+
+final_pred = predict(final_model, newdata = test_data)
+
+confusionMatrix(final_pred, test_data$readmission, positive = "Yes")
+```
+
+```{r roc, message=FALSE}
+final_pred_prob = predict(final_model, newdata = test_data, type = "prob")
+
+roc_analysis = roc(
+  response  = test_data$readmission,
+  predictor = final_pred_prob[, "Yes"]
+)
+
+plot(
+  1 - roc_analysis$specificities,
+  roc_analysis$sensitivities,
+  type = "l", col = "steelblue", lwd = 2,
+  ylab = "Sensitivity",
+  xlab = "1 - Specificity",
+  main = "Figure 5: ROC Curve — Final Model (Test Set)"
+)
+abline(a = 0, b = 1, lty = 2)
+legend("bottomright",
+       legend = paste("AUC =", round(auc(roc_analysis), 3)),
+       col    = "steelblue", lwd = 2)
+
+cat("Test Set AUC:", round(auc(roc_analysis), 3), "\n")
+```
+
+**Variable Importance — Final Model**
+
+```{r varimp, message=FALSE}
+gbm_imp_final = summary(final_model$finalModel,
+                        n.trees = final_model$bestTune$n.trees,
+                        plotit  = FALSE)
+
+gbm_imp_final |>
+  slice_max(rel.inf, n = 10) |>
+  ggplot(aes(x = rel.inf, y = reorder(var, rel.inf))) +
+  geom_col(fill = "steelblue") +
+  labs(x     = "Relative Influence",
+       y     = "Feature",
+       title = "Figure 6: Final Model — Top 10 Most Important Features") +
+  theme_minimal()
+```
+
+**Description:** In the test set, the final [*model name*] model achieved an accuracy of
+[*X*]%, sensitivity of [*X*]%, specificity of [*X*]%, and Kappa of [*X*]. The AUC of [*X*]
+in _Figure 5_ confirms [*good/moderate*] discriminative ability, substantially above the
+0.5 baseline of random guessing. As shown in _Figure 6_, the most important predictors
+were [*list top 3*], which is clinically meaningful because [*brief clinical interpretation
+— e.g., "Age reflects cumulative cardiovascular risk, while elevated WBC at admission
+signals acute systemic inflammation, both of which can impair post-discharge recovery and
+increase vulnerability to rehospitalization."*] The low PPV ([*X*]%) reflects the
+underlying rarity of the outcome; the model is better suited as a **screening tool** to
+flag high-risk patients for targeted follow-up than as a stand-alone diagnostic instrument.
+
+---
+
+#### **3. Reflection: Comparing Random Forest and GBM in a Clinical Setting**
+
+In this analysis, we compared two ensemble tree-based methods — random forest and gradient
+boosting — to predict 30-day AMI readmission. Briefly discuss one key conceptual difference
+between these two methods and how that difference may affect their suitability for clinical
+prediction.
+
+**Answer:** Random forest and gradient boosting differ fundamentally in how trees are built
+and combined. In random forest, trees are grown *in parallel* and independently on
+bootstrapped samples of the training data, and predictions are averaged across all trees.
+This parallel structure makes random forest robust to noise and less prone to overfitting,
+since errors in individual trees tend to cancel out. In gradient boosting, trees are grown
+*sequentially*, with each new tree specifically targeting the residual errors left by the
+previous model. This allows GBM to reduce bias systematically and capture complex patterns
+in the data, but also makes it more sensitive to hyperparameter choices and computationally
+demanding to tune. In a clinical prediction context with a small sample size — as in this
+AMI readmission dataset — random forest's greater stability may be advantageous, whereas
+GBM's flexibility can yield higher performance when there is sufficient data and careful
+tuning. The choice ultimately depends on whether the clinical priority is robustness and
+interpretability or maximizing discriminative performance.
+
+
+
+
+#### **AI tools**
+
+Claude.ai was used in this assignment to assist with debugging R code syntax errors and editing text for clarity and conciseness.
